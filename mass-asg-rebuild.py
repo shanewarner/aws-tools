@@ -5,15 +5,18 @@ Author: shane.warner@fox.com
 Synopsis: This tool automatically locates autoscaling enabled clusters in ASGARD, builds and bootstraps fresh nodes for them
 via Chef, and creates AMI images for the resulting node builds for use with ASGARD and autoscaling groups.
 """
+
 import chef
 import boto
 import sys
+import copy
 import time
 import pprint
 from datetime import datetime
+from boto.ec2.blockdevicemapping import BlockDeviceType, BlockDeviceMapping
 
 # Globals
-imageId='ami-5d3d1f34'
+imageId='ami-04fe926c'
 failed_ids = []
 
 class asg(object):
@@ -26,10 +29,15 @@ class asg(object):
             print e
         self.threshold = 2400
 
-    def cleanup(self):
+    def cleanup(self, instance_ids, terminate=True):
         """
         Deletes the build nodes and clients out of the Chef server.
+        Also terminates all instances that were launched as a result of the build.
+        :param instances_ids: List of instance ids to terminate
         """
+
+        for instance in instance_ids:
+            self.terminate(instance)
 
         for row in chef.Search('node', 'name:*.internal'):
             node = chef.Node(row.object.name)
@@ -151,6 +159,13 @@ class asg(object):
         status = 0
         now = time.time()
         timelimit = now + self.threshold
+        map = BlockDeviceMapping()
+        eph0 = BlockDeviceType()
+        eph1 = BlockDeviceType()
+        eph0.ephemeral_name = 'ephemeral0'
+        eph1.ephemeral_name = 'ephemeral1'
+        map['/dev/sdb'] = eph0
+        map['/dev/sdc'] = eph1
 
         print "-------------------------------"
         print "Launching Chef builds"
@@ -162,7 +177,7 @@ class asg(object):
 
             try:
                 reservation = self.ec2.run_instances(image_id=imageId, key_name='ffe-ec2', security_groups=securityGroups,
-                                            instance_type='c1.xlarge', user_data=userData)
+                                            instance_type='c3.xlarge', user_data=userData, block_device_map=map)
                 print "Launched " + reservation.id
                 reservation_ids.append((reservation.id))
             except Exception as e:
@@ -242,13 +257,26 @@ class asg(object):
 
         return completed
 
+    def terminate(self, instance_id):
+        """
+        Terminates the supplied instance ID.
+        :param instance_id: Instance ID to terminate.
+        :return: True or False
+        """
+        try:
+            self.ec2.terminate_instances(instance_ids=instance_id)
+        except Exception as e:
+            print "Failed to terminate instance id {0}".format(instance_id)
+            print e
+
 def main():
     autoscale = asg()
     cluster_data = autoscale.build_list()
     instance_ids = autoscale.build_servers(cluster_data)
+    terminate_ids = copy.copy(instance_ids)
     stopped = autoscale.stop_servers(instance_ids)
     completed = autoscale.create_images(stopped)
-    autoscale.cleanup()
+    autoscale.cleanup(terminate_ids)
 
     print "Run complete."
     print "SUMMARY:"
