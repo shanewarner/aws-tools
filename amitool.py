@@ -4,21 +4,26 @@ amitool.py provides a toolset for common AMI operations.
 
 Currently only connects to the region from which it is run.
 """
-__author__ = 'shane.warner@fox.com'
+__author__ = 'shane@darkstarnet.net'
 
 import sys
 import re
 import boto
+import boto.ec2.autoscale
 import argparse
 from argparse import RawTextHelpFormatter
 
-class ami(object):
+
+class Ami(object):
     def __init__(self):
         try:
             self.ec2 = boto.connect_ec2()
+            self.asg = boto.connect_autoscale()
+            self.in_use_amis = [launch_config.image_id for launch_config in self.asg.get_all_launch_configurations()]
+
         except Exception as e:
             print e
-            return -1
+            sys.exit(2)
 
     def create(self, instance_id, name, desc):
         """
@@ -34,16 +39,16 @@ class ami(object):
         print "{0} => {1}".format(instance_id, ami)
         return
 
-    def delete(self, ami):
+    def delete(self, ami_):
         """
         Deletes the supplied ami-id.
         :param ami: Ami ID. Ex. ami-4234563
         """
         try:
-            self.ec2.deregister_image(ami, delete_snapshot=True)
-            print "Deleted {0}".format(ami)
+            self.ec2.deregister_image(ami_, delete_snapshot=True)
+            print "Deleted {0}".format(ami_)
         except Exception as e:
-            print "Failed to delete {0}".format(ami)
+            print "Failed to delete {0}".format(ami_)
             print e
             return -1
 
@@ -63,6 +68,17 @@ class ami(object):
             return -1
 
         return
+
+    def in_use(self, ami_id):
+        """
+        Checks if the specified AMI is in use by an autoscaling group launch config.
+        :param ami_: AMI ID
+        :return: True or False
+        """
+        if ami_id in self.in_use_amis:
+            return True
+
+        return False
 
     def search(self, pattern):
         """
@@ -88,15 +104,15 @@ class ami(object):
             print e
             return -1
 
-        for ami in amis:
-            if ami and (re.search(pattern, str(ami.description)) or re.search(pattern, str(ami.name))):
+        for ami_ in amis:
+            if ami_ and (re.search(pattern, str(ami_.description)) or re.search(pattern, str(ami_.name))):
                 count += 1
-                print "{0:s} => {1:s} {2:s}".format(ami.id, ami.name, ami.description)
-                for device, volume in ami.block_device_mapping.iteritems():
+                print "{0:s} => {1:s} {2:s}".format(ami_.id, ami_.name, ami_.description)
+                for device, volume in ami_.block_device_mapping.iteritems():
                     if volume.snapshot_id:
                         snap_id = volume.snapshot_id
 
-                images.append((ami.id, ami.name, ami.description, snap_id))
+                images.append((ami_.id, ami_.name, ami_.description, snap_id))
 
         for snapshot in snapshots:
             for ami_id, ami_name, ami_description, snap_id in images:
@@ -130,13 +146,15 @@ class ami(object):
                         orphans.append((snapshot.id, match.group()))
                         space = space+snapshot.volume_size
                         count += 1
-                        print "orphaned ami snapshot: {0:s} => {1:s} {2}GB".format(snapshot.id, match.group(), snapshot.volume_size)
+                        print "orphaned ami snapshot: {0:s} => {1:s} {2}GB".format(snapshot.id, match.group(),
+                                                                                   snapshot.volume_size)
 
         print "-----------------------"
         print "        SUMMARY        "
         print "-----------------------"
         print "total orphans: {0} total space: {1}GB".format(count, space)
         return orphans
+
 
 def main():
 
@@ -160,9 +178,10 @@ def main():
     search_parser.add_argument('mode', choices=['ami', 'orphan'])
     search_parser.add_argument('--regex', help='Regex pattern for AMI search.', default='.*')
     search_parser.add_argument('--delete', action='store_true', help='WARNING: This flag will delete objects returned by search.')
+    search_parser.add_argument('--force', action='store_true', help='WARNING: This flag will FORCE deletion of AMI images that are in use by autoscaling groups.')
 
     args = vars(parser.parse_args())
-    api = ami()
+    api = Ami()
 
     if args['operation'] == 'create':
         api.create(args['instance_id'], args['name'],args['desc'])
@@ -177,7 +196,15 @@ def main():
                 confirmation = raw_input('Confirm DELETE of found images (Y/N): ')
                 if confirmation == 'Y':
                     for ami_id, ami_name, ami_description, snap_id in images:
-                        api.delete(ami_id)
+                        if args['force']:
+                            api.delete(ami_id)
+                        else:
+                            if api.in_use(ami_id):
+                                print "ERROR: Not deleting {0} as it is in use by an active launch config. Use --force to force deletion.".format(ami_id)
+                                continue
+                            else:
+                                api.delete(ami_id)
+
         if args['mode'] == 'orphan':
             print "Finding orphans"
             orphans = api.find_orphans()
