@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 import sys
 import urllib2
@@ -9,36 +9,58 @@ import re
 import time
 import argparse
 import boto
+import boto3
 
-asgard_host = 'asgard.darkstarnet:8080'
+asgard_host = 'devops.fdmit.com:8081'
 ec2_region = 'us-east-1'
 base_url = 'http://' + asgard_host + '/' + ec2_region
-notify = 'shane@darkstarnet.net'
+notify = 'shane.warner@fox.com'
 judgement_txt = "ASG will now be evaluated for up to .* minutes during the judgment period."
-poll_timeout = 600  # Timeout for polling
 regex = ""
+requests_timeout = 30
 
 
 def assign_eip(eip, instance_id):
-    conn = boto.connect_ec2()
+    client = boto3.client('ec2', region_name=ec2_region)
+    allocation_id = client.describe_addresses(PublicIps=[eip]).get("Addresses")[0]["AllocationId"]
 
     try:
-        conn.associate_address(instance_id, eip)
+        association_id = client.describe_addresses(PublicIps=[eip]).get("Addresses")[0]["AssociationId"]
+    except IndexError:
+        association_id = ""
+
+    # In VPC, if the address is already associated we must disassociate it first
+    if association_id:
+        client.disassociate_address(AssociationId=association_id)
+
+    try:
+        client.associate_address(InstanceId=instance_id, AllocationId=allocation_id)
     except Exception as e:
-        print "[-] Error assigning rollback EIP to instance!"
+        print "[-] Error assigning rollback EIP to original instance!"
         print e
         sys.exit(2)
 
     print "[+] Assigned {0} back to owner {1}.".format(eip, instance_id)
 
+    #conn = boto.connect_ec2()
+
+    #try:
+    #    conn.associate_address(instance_id, eip)
+    #except Exception as e:
+    #    print "[-] Error assigning rollback EIP to instance!"
+    #    print e
+    #    sys.exit(2)
+
+    #print "[+] Assigned {0} back to owner {1}.".format(eip, instance_id)
+
 
 def get_token(deployment_id):
-    response = requests.get(base_url + '/deployment/show/' + deployment_id)
+    response = requests.get(base_url + '/deployment/show/' + deployment_id, timeout=requests_timeout)
     return response.json()["token"]
 
 
 def get_error(poll_url):
-    return requests.get(poll_url).json()["log"]
+    return requests.get(poll_url, timeout=requests_timeout).json()["log"]
 
 
 def judgement_ready(response):
@@ -49,14 +71,17 @@ def judgement_ready(response):
 
 
 def qa(response):
-    if len(regex) > 0:
-        if re.search(regex, response.text):
-            print "[+] qa(): found string \"{0}\"".format(regex)
-            return True
-    else:
-        if response.status_code == 200:
-            print "[+] qa(): got status code 200"
-            return True
+    try:
+        if len(regex) > 0:
+            if re.search(regex, response.text):
+                print "[+] qa(): found string \"{0}\"".format(regex)
+                return True
+        else:
+            if response.status_code == 200:
+                print "[+] qa(): got status code 200"
+                return True
+    except Exception:
+        return False
     return False
 
 
@@ -96,13 +121,20 @@ def proceed(deployment_id):
 
 
 def main():
-    version = '1.2'
+    version = '1.3'
 
     parser = argparse.ArgumentParser(description="AMI Asgard Deployment Script.")
     parser.add_argument("-n", "--nofollow", action='store_true', help="Do not follow redirects for the test URL.")
     parser.add_argument("--eip", help="Elastic IP address for rollback. (EIP based deployments only).", required=False)
     parser.add_argument("-b", "--bypass", action="store_true", help="Bypass the URL test")
-    parser.add_argument("-t", "--timeout", action="store_true", help="Specify polling timeout. (Default: 600 seconds)")
+    parser.add_argument("-j", "--judgment", help="Judgment timeout Default: 150 seconds", required=False, const=150,
+                        nargs='?', type=int, default=150)
+    parser.add_argument("-s", "--startup", help="Asgard in-service startup timeout. Default: 10 minutes",
+                        required=False, const=10, nargs='?', type=int, default=10)
+    parser.add_argument('-t', '--timeout', help='Asgard polling timeout. (How long to wait for deployment to enter'
+                                                'judgment phase before rolling back). '
+                        'Default: 600 seconds', required=False,
+                        const=600, nargs='?', type=int, default=600)
     parser.add_argument('asg_id')
     parser.add_argument('ami_id')
     parser.add_argument('test_url', nargs='?')
@@ -113,10 +145,9 @@ def main():
 
     asg_id = args.asg_id
     ami_id = args.ami_id
-
-    if args.timeout:
-        global poll_timeout
-        poll_timeout = args.timeout
+    poll_timeout = args.timeout
+    judge_timeout = args.judgment
+    startup_timeout = args.startup
 
     if not args.bypass:
         test_url = args.test_url
@@ -147,7 +178,7 @@ def main():
         "steps": [
             {"type": "CreateAsg"},
             {"type": "Resize", "targetAsg": "Next", "capacity": deflc['asgOptions']['minSize'],
-             "startUpTimeoutMinutes": 10},
+             "startUpTimeoutMinutes": startup_timeout},
             {"type": "DisableAsg", "targetAsg": "Previous"},
             {"type": "Judgment", "durationMinutes": 30},
             {"type": "DeleteAsg", "targetAsg": "Previous"},
@@ -165,20 +196,24 @@ def main():
     deployment_id = response.json()["deploymentId"]
     poll_url = base_url + '/task/show/' + deployment_id + '.json'
 
-    time.sleep(30)
+    time.sleep(15)
 
     try:
         polling.poll(
-            lambda: requests.get(poll_url),
+            lambda: requests.get(poll_url, allow_redirects=True, timeout=requests_timeout),
             check_success=judgement_ready,
             step=30,
             timeout=poll_timeout
         )
-    except Exception as e:
-        print "[-] Error waiting for judgement: {0} \n{1}".format(e, get_error(poll_url))
+    except polling.TimeoutException, te:
+        print "[-] Error waiting for judgement."
+        while not te.values.empty():
+            print "{0}".format(te.values.get())
+        print "{0}".format(get_error(poll_url))
         sys.exit(2)
 
     if args.eip:
+        time.sleep(30)
         if rbinstance_id == search_ip(args.eip):
             print "[-] Error: New instance did not assign itself EIP: {0}. Cannot proceed with judgment. " \
                   "Initiating rollback.".format(args.eip)
@@ -188,20 +223,21 @@ def main():
 
     if not args.bypass:
         if args.nofollow:
-            test_func = requests.get(test_url, allow_redirects=False)
+            allow_redirects = False
         else:
-            test_func = requests.get(test_url, allow_redirects=True)
-
+            allow_redirects = True
         try:
             polling.poll(
-                lambda: test_func,
+                lambda: requests.get(test_url, allow_redirects=allow_redirects, timeout=requests_timeout),
                 check_success=qa,
+                ignore_exceptions=(requests.exceptions.Timeout, requests.exceptions.ConnectionError),
                 step=3,
-                timeout=150
+                timeout=judge_timeout
             )
-        except Exception as e:
+        except polling.TimeoutException, te:
             print "[-] Error running test: Test url failed to meet test criteria."
-            print "{0}".format(e)
+            while not te.values.empty():
+                print "{0}".format(te.values.get())
             print "[+] Initiating rollback of deployment."
             rollback(deployment_id)
             if args.eip:
@@ -213,6 +249,7 @@ def main():
     else:
         print "[+] Test bypassed. Proceeding deployment."
         proceed(deployment_id)
+
 
 if __name__ == '__main__':
     main()
