@@ -11,7 +11,7 @@ import argparse
 import boto
 import boto3
 
-asgard_host = 'devops.fdmit.com:8081'
+asgard_host = 'devops.domain.com:8081'
 ec2_region = 'us-east-1'
 base_url = 'http://' + asgard_host + '/' + ec2_region
 notify = 'shane.warner@fox.com'
